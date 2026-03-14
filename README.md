@@ -34,37 +34,40 @@ cd contracts
 forge install
 forge build
 forge test
+```
 
 ### Executor (Rust Agent)
 ```bash
 cd executor
 cargo build
 cargo test
+```
 
 ### Frontend
 ```bash
 cd frontend
 npm install
 npm run dev
+```
 
-## 🔗 Links
+### 🔗 Links
 🌐 Testnet: https://app.hyperliquid-testnet.xyz
 🔍 Explorer: https://explorer.hyperliquid-testnet.xyz
 📚 Docs: https://docs.hyperliquid.xyz
 
-## 🛡️ Security
+### 🛡️ Security
 ⚠️ This is experimental software. Use at your own risk.
 Keys never leave TEE/sandbox
 Position limits & slippage caps enforced
 Emergency pause & withdraw mechanisms
 
-## 🤝 Contributing
+### 🤝 Contributing
 Fork the repo
 Create feature branch (git checkout -b feat/amazing-feature)
 Commit changes (git commit -m 'Add amazing feature')
 Push to branch (git push origin feat/amazing-feature)
 Open Pull Request
 
-## 📜 License
+### 📜 License
 MIT License — see LICENSE file.
 Built with ❤️ for degens, creators, and alpha hunters.
