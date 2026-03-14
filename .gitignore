@@ -1,0 +1,55 @@
+# === Foundry / Solidity ===
+out/
+cache/
+broadcast/
+*.t.sol
+*.s.sol
+forge-cache/
+
+# === Rust / Executor ===
+executor/target/
+*.rs.bk
+Cargo.lock
+
+# === Next.js / Frontend ===
+frontend/.next/
+frontend/out/
+frontend/node_modules/
+frontend/*.log
+*.env.local
+*.env*.local
+
+# === Node / General ===
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+.pnp.*
+.DS_Store
+*.log
+
+# === IDE / Editor ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# === Secrets (НИКОГДА не коммитить!) ===
+*.pem
+*.key
+private_keys/
+secrets/
+.env
+!.env.example
+
+# === Build artifacts ===
+*.o
+*.so
+*.dylib
+*.exe
+
+# === Python (если будут скрипты) ===
+__pycache__/
+*.pyc
+venv/
+
