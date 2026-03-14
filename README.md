@@ -34,18 +34,21 @@ cd contracts
 forge install
 forge build
 forge test
+```
 
 ### Executor (Rust Agent)
 ```bash
 cd executor
 cargo build
 cargo test
+```
 
 ### Frontend
 ```bash
 cd frontend
 npm install
 npm run dev
+```
 
 ## 🔗 Links
 🌐 Testnet: https://app.hyperliquid-testnet.xyz
