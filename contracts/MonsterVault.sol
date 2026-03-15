@@ -1,26 +1,36 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/proxy/Initializable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+// ВСЕ импорты из upgradeable-пакета для совместимости
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+
 import "../interfaces/IStrategyConfig.sol";
 import "../interfaces/IMonsterVault.sol";
 
-contract MonsterVault is Initializable, ERC20, Ownable, ReentrancyGuard, IMonsterVault {
-    // === Constants ===
+contract MonsterVault is 
+    Initializable, 
+    ERC20Upgradeable, 
+    OwnableUpgradeable, 
+    ReentrancyGuardUpgradeable, 
+    IMonsterVault 
+{
+    // === Constants (public для доступа извне) ===
     uint256 public constant CURVE_SCALE = 1000 * 10**18;
-    uint256 public constant PLATFORM_FEE_BPS = 500; // 5%
+    uint256 public constant PLATFORM_FEE_BPS = 500;
     uint256 public constant MAX_LEVERAGE = 50;
     
     // === State ===
     address public immutable factory;
     address public creator;
+    address public executor;
     bytes32 public configHash;
     int256 public totalPnL;
     uint256 public basePrice;
     bool public isActive;
+    bool public isPaused;
     
     IStrategyConfig.StrategyParams public params;
     
@@ -31,13 +41,18 @@ contract MonsterVault is Initializable, ERC20, Ownable, ReentrancyGuard, IMonste
     }
     
     modifier onlyExecutor() {
-        // В продакшене: проверка через TEE-подпись или multisig
-        require(msg.sender == creator || msg.sender == factory, "Not executor");
+        require(msg.sender == executor || msg.sender == factory, "Not executor");
+        _;
+    }
+    
+    modifier whenNotPaused() {
+        require(!isPaused, "Paused");
         _;
     }
 
-    constructor(address _factory) ERC20("", "") {
+    constructor(address _factory) {
         factory = _factory;
+        _disableInitializers();
     }
 
     function initialize(
@@ -45,104 +60,116 @@ contract MonsterVault is Initializable, ERC20, Ownable, ReentrancyGuard, IMonste
         string memory _name,
         string memory _symbol,
         bytes32 _configHash,
-        IStrategyConfig.StrategyParams memory _params
+        IStrategyConfig.StrategyParams memory _params,
+        address _executor
     ) public initializer {
+        // Инициализация upgradeable-контрактов
         __ERC20_init(_name, _symbol);
-        __Ownable_init(_creator);
+        __Ownable_init();  // Без аргументов — владелец = msg.sender (factory)
+        __ReentrancyGuard_init();
+        
+        // Передаём финальное владение создателю
+        _transferOwnership(_creator);
         
         creator = _creator;
+        executor = _executor;
         configHash = _configHash;
         params = _params;
         basePrice = 1 gwei;
         isActive = true;
+        isPaused = false;
         
-        // Минтим начальные токены за депозит (если есть)
         if (_params.initialDeposit > 0) {
             _mint(_creator, _params.initialDeposit);
         }
     }
 
     // === Bonding Curve: Buy ===
-    function buy() external payable nonReentrant returns (uint256) {
+    function buy() external payable nonReentrant whenNotPaused returns (uint256) {
         require(msg.value > 0, "Zero buy");
         require(isActive, "Vault inactive");
         
-        uint256 tokensToMint = _calculateBuyAmount(msg.value);
+        uint256 price = getCurrentPrice();
+        uint256 tokensToMint = (msg.value * 1e18) / price;
         require(tokensToMint > 0, "Too small amount");
         
         _mint(msg.sender, tokensToMint);
-        emit LiquidityAdded(msg.sender, msg.value, tokensToMint);
+        emit LiquidityAdded(msg.sender, msg.value, tokensToMint, price);
         return tokensToMint;
     }
 
     // === Bonding Curve: Sell ===
-    function sell(uint256 tokenAmount) external nonReentrant returns (uint256) {
+    function sell(uint256 tokenAmount) external nonReentrant whenNotPaused returns (uint256) {
         require(tokenAmount > 0, "Zero sell");
         require(balanceOf(msg.sender) >= tokenAmount, "Insufficient balance");
         
-        uint256 ethToReturn = _calculateSellAmount(tokenAmount);
+        uint256 price = getCurrentPrice();
+        uint256 sellPrice = (price * 98) / 100; // 2% spread
+        uint256 ethToReturn = (tokenAmount * sellPrice) / 1e18;
+        
         require(ethToReturn > 0, "Too small amount");
         require(address(this).balance >= ethToReturn, "Insufficient liquidity");
         
         _burn(msg.sender, tokenAmount);
         payable(msg.sender).transfer(ethToReturn);
-        emit LiquidityRemoved(msg.sender, tokenAmount, ethToReturn);
+        emit LiquidityRemoved(msg.sender, tokenAmount, ethToReturn, price);
         return ethToReturn;
     }
 
-    // === Pricing Logic (Hybrid: Demand + PNL) ===
-    function _calculateBuyAmount(uint256 ethAmount) internal view returns (uint256) {
-        uint256 price = getCurrentPrice();
-        return (ethAmount * 1e18) / price;
-    }
-
-    function _calculateSellAmount(uint256 tokenAmount) internal view returns (uint256) {
-        uint256 price = getCurrentPrice();
-        // Применяем небольшой спред при продаже (2%)
-        return (tokenAmount * price * 98) / (1e18 * 100);
-    }
-
+    // === Hybrid Pricing ===
     function getCurrentPrice() public view returns (uint256) {
         uint256 supply = totalSupply();
         if (supply == 0) return basePrice;
         
-        // Базовая экспоненциальная кривая от supply
         uint256 demandPrice = basePrice + (supply / CURVE_SCALE);
         
-        // Буст от PNL (только положительный, с капом 2x)
         if (totalPnL > 0) {
-            uint256 pnlBoost = uint256(totalPnL) / 1e18; // конвертим в "коэффициент"
-            if (pnlBoost > 2e18) pnlBoost = 2e18; // кап 200%
+            uint256 pnlBoost = uint256(totalPnL) / 1e18;
+            if (pnlBoost > 2e18) pnlBoost = 2e18;
             return demandPrice * (1e18 + pnlBoost) / 1e18;
+        }
+        
+        if (totalPnL < 0) {
+            uint256 floorPrice = demandPrice / 2;
+            return demandPrice > floorPrice ? demandPrice : floorPrice;
         }
         
         return demandPrice;
     }
 
-    // === Executor Functions (вызываются агентом) ===
-    function updatePnL(int256 delta) external onlyExecutor {
+    // === Executor Functions ===
+    function updatePnL(int256 delta, bytes32 tradeId) external onlyExecutor {
         totalPnL += delta;
-        emit StrategyExecuted(delta, block.timestamp);
+        emit StrategyExecuted(delta, block.timestamp, tradeId);
     }
 
-    function updateConfig(bytes32 newHash) external onlyOwner {
-        emit ConfigUpdated(configHash, newHash);
-        configHash = newHash;
+    function updateExecutor(address newExecutor) external onlyOwner {
+        emit ExecutorUpdated(executor, newExecutor);
+        executor = newExecutor;
     }
 
-    function pause() external onlyOwner {
-        isActive = false;
-    }
+    // === Safety ===
+    function pause() external onlyOwner { isPaused = true; }
+    function unpause() external onlyOwner { isPaused = false; }
 
-    function unpause() external onlyOwner {
-        isActive = true;
-    }
-
-    // === Emergency Withdraw (только для создателя, с ограничением) ===
     function emergencyWithdraw(uint256 amount) external onlyOwner {
-        require(!isActive, "Must be paused");
-        require(amount <= address(this).balance * 10 / 100, "Max 10% per withdraw");
+        require(isPaused, "Must be paused");
+        require(amount <= address(this).balance * 10 / 100, "Max 10%");
         payable(creator).transfer(amount);
+    }
+
+    // === Views ===
+    function getVaultStats() external view returns (
+        uint256 price,
+        uint256 supply,
+        int256 pnl,
+        bool active,
+        string memory asset
+    ) {
+        string memory assetName = params.assetId == 0 ? "BTC" : 
+                                  params.assetId == 1 ? "ETH" : 
+                                  params.assetId == 2 ? "SOL" : "ALT";
+        return (getCurrentPrice(), totalSupply(), totalPnL, isActive && !isPaused, assetName);
     }
 
     receive() external payable {}

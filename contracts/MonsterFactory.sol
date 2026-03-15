@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import "@openzeppelin/contracts/proxy/Clones.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/ClonesUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "./MonsterVault.sol";
 import "../interfaces/IStrategyConfig.sol";
 
-contract MonsterFactory is Ownable {
+contract MonsterFactory is OwnableUpgradeable {
     address public implementation;
     
     event MonsterLaunched(
@@ -17,9 +17,10 @@ contract MonsterFactory is Ownable {
         bytes32 configHash
     );
     
-    event ImplementationUpdated(address indexed oldImpl, address indexed newImpl);
+    constructor() { _disableInitializers(); }
     
-    constructor(address _implementation) {
+    function initialize(address _implementation) public initializer {
+        __Ownable_init();
         _setImplementation(_implementation);
     }
     
@@ -30,41 +31,28 @@ contract MonsterFactory is Ownable {
         bytes32 _configHash,
         IStrategyConfig.StrategyParams calldata _params
     ) external returns (address vault) {
-        require(_params.leverage <= MonsterVault.MAX_LEVERAGE, "Leverage too high");
+        // Hardcode MAX_LEVERAGE check (50)
+        require(_params.leverage <= 50, "Leverage too high");
         
-        // Деплоим клон
-        vault = Clones.clone(implementation);
+        vault = ClonesUpgradeable.clone(implementation);
         
-        // Инициализируем
-        MonsterVault(vault).initialize(
+        MonsterVault(payable(vault)).initialize(
             _creator,
             _name,
             _symbol,
             _configHash,
-            _params
+            _params,
+            msg.sender
         );
         
-        // Эмитим событие
-        emit MonsterLaunched(
-            vault,
-            MonsterVault(vault).address(), // token address = vault address для простоты
-            _creator,
-            _name,
-            _configHash
-        );
+        emit MonsterLaunched(vault, vault, _creator, _name, _configHash);
     }
     
     function _setImplementation(address _newImpl) internal {
-        emit ImplementationUpdated(implementation, _newImpl);
         implementation = _newImpl;
     }
     
     function setImplementation(address _newImpl) external onlyOwner {
         _setImplementation(_newImpl);
-    }
-    
-    // Вспомогательная функция для получения адреса токена
-    function getTokenAddress(address vault) external pure returns (address) {
-        return vault; // В этой реализации токен = вольтом
     }
 }
