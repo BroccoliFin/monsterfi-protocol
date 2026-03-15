@@ -1,0 +1,10 @@
+/Users/mikhailsadovoy/monsterfi-protocol/agent/target/debug/deps/enr-24f6a7d325e1489f.d: /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/lib.rs /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/builder.rs /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/error.rs /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/keys/mod.rs /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/keys/k256_key.rs /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/node_id.rs
+
+/Users/mikhailsadovoy/monsterfi-protocol/agent/target/debug/deps/libenr-24f6a7d325e1489f.rmeta: /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/lib.rs /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/builder.rs /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/error.rs /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/keys/mod.rs /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/keys/k256_key.rs /Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/node_id.rs
+
+/Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/lib.rs:
+/Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/builder.rs:
+/Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/error.rs:
+/Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/keys/mod.rs:
+/Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/keys/k256_key.rs:
+/Users/mikhailsadovoy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/enr-0.10.0/src/node_id.rs:

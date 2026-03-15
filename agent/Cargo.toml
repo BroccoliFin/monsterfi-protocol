@@ -1,12 +1,54 @@
 [package]
-name = "monster-claw"
-version = "0.1.0"
+name = "monsterfi-executor"
+version = "0.2.0"
 edition = "2021"
+description = "MonsterFi trading agent — Rust edition"
+license = "MIT"
+
+# [[bin]] секция НЕ нужна для src/main.rs — Cargo сам найдёт бинарник
 
 [dependencies]
-tokio = { version = "1.43", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# === Async runtime ===
+tokio = { version = "1", features = ["full"] }
+
+# === HTTP client ===
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# === Serialization ===
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# === Ethereum / HyperEVM signing ===
+ethers = { version = "2", features = ["rustls"] }
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+
+# === Error handling ===
+anyhow = "1"
+thiserror = "1"
+
+# === Logging ===
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1.0"
+
+# === Time ===
+chrono = { version = "0.4", features = ["serde"] }
+
+# === Config / env ===
+dotenvy = "0.15"
+
+# === CLI args ===
+clap = { version = "4", features = ["derive", "color"] }
+
+# === Number formatting ===
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,13 +1,16 @@
-.PHONY: build test deploy clean
+.PHONY: build test deploy-testnet clean
 
 build:
-	forge build --sizes
+    forge build --sizes
 
 test:
-	forge test -vvv
+    forge test -vvv
 
 deploy-testnet:
-	forge script script/Deploy.s.sol --rpc-url hyperliquid_testnet --broadcast -vvvv
+    @forge script script/DeployVault.s.sol:DeployVault \
+      --rpc-url https://rpc.hyperliquid-testnet.xyz \
+      --broadcast --verify --legacy \
+      -vvvv
 
 clean:
-	forge clean
+    forge clean
