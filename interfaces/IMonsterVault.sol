@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-// ВАЖНО: Используем IERC20Upgradeable для совместимости с ERC20Upgradeable
-import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-interface IMonsterVault is IERC20Upgradeable {
+interface IMonsterVault is IERC20 {
     event StrategyExecuted(int256 pnlDelta, uint256 timestamp, bytes32 tradeId);
     event LiquidityAdded(address indexed user, uint256 amount, uint256 tokensMinted, uint256 price);
     event LiquidityRemoved(address indexed user, uint256 tokensBurned, uint256 amountReturned, uint256 price);

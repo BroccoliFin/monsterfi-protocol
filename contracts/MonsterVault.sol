@@ -1,23 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-// ВСЕ импорты из upgradeable-пакета для совместимости
-import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "../interfaces/IStrategyConfig.sol";
 import "../interfaces/IMonsterVault.sol";
 
-contract MonsterVault is 
-    Initializable, 
-    ERC20Upgradeable, 
-    OwnableUpgradeable, 
-    ReentrancyGuardUpgradeable, 
-    IMonsterVault 
-{
-    // === Constants (public для доступа извне) ===
+contract MonsterVault is ERC20, Ownable, ReentrancyGuard, IMonsterVault {
+    // === Constants ===
     uint256 public constant CURVE_SCALE = 1000 * 10**18;
     uint256 public constant PLATFORM_FEE_BPS = 500;
     uint256 public constant MAX_LEVERAGE = 50;
@@ -50,27 +41,16 @@ contract MonsterVault is
         _;
     }
 
-    constructor(address _factory) {
-        factory = _factory;
-        _disableInitializers();
-    }
-
-    function initialize(
+    constructor(
+        address _factory,
         address _creator,
         string memory _name,
         string memory _symbol,
         bytes32 _configHash,
         IStrategyConfig.StrategyParams memory _params,
         address _executor
-    ) public initializer {
-        // Инициализация upgradeable-контрактов
-        __ERC20_init(_name, _symbol);
-        __Ownable_init();  // Без аргументов — владелец = msg.sender (factory)
-        __ReentrancyGuard_init();
-        
-        // Передаём финальное владение создателю
-        _transferOwnership(_creator);
-        
+    ) ERC20(_name, _symbol) Ownable() {
+        factory = _factory;
         creator = _creator;
         executor = _executor;
         configHash = _configHash;
@@ -78,6 +58,8 @@ contract MonsterVault is
         basePrice = 1 gwei;
         isActive = true;
         isPaused = false;
+        
+        transferOwnership(_creator);
         
         if (_params.initialDeposit > 0) {
             _mint(_creator, _params.initialDeposit);
@@ -104,7 +86,7 @@ contract MonsterVault is
         require(balanceOf(msg.sender) >= tokenAmount, "Insufficient balance");
         
         uint256 price = getCurrentPrice();
-        uint256 sellPrice = (price * 98) / 100; // 2% spread
+        uint256 sellPrice = (price * 98) / 100;
         uint256 ethToReturn = (tokenAmount * sellPrice) / 1e18;
         
         require(ethToReturn > 0, "Too small amount");
@@ -116,19 +98,24 @@ contract MonsterVault is
         return ethToReturn;
     }
 
-    // === Hybrid Pricing ===
+    // === Hybrid Pricing: Demand + PNL (FIXED) ===
     function getCurrentPrice() public view returns (uint256) {
         uint256 supply = totalSupply();
         if (supply == 0) return basePrice;
         
+        // Базовая цена от спроса
         uint256 demandPrice = basePrice + (supply / CURVE_SCALE);
         
+        // Буст от положительного PNL (в базисных пунктах, кап 100% = 2x)
         if (totalPnL > 0) {
-            uint256 pnlBoost = uint256(totalPnL) / 1e18;
-            if (pnlBoost > 2e18) pnlBoost = 2e18;
-            return demandPrice * (1e18 + pnlBoost) / 1e18;
+            // PnL в wei → базисные пункты относительно basePrice
+            // 1 ETH PnL на базе 1 gwei = огромный буст, поэтому капируем
+            uint256 boostBps = uint256(totalPnL) * 10000 / basePrice;
+            if (boostBps > 10000) boostBps = 10000; // cap at 100% = 2x multiplier
+            return demandPrice * (10000 + boostBps) / 10000;
         }
         
+        // Hard floor: -50% от demand price при убытках
         if (totalPnL < 0) {
             uint256 floorPrice = demandPrice / 2;
             return demandPrice > floorPrice ? demandPrice : floorPrice;
