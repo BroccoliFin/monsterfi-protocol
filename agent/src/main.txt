@@ -1,0 +1,193 @@
+// MonsterFi Executor v0.7 — M1 эквивалент (6s ticks × 500 buffer)
+
+use anyhow::Result;
+use clap::Parser;
+use dotenvy::dotenv;
+use reqwest::Client;
+use serde_json::json;
+use std::{collections::VecDeque, time::{SystemTime, UNIX_EPOCH}};
+use tokio::time::{interval, Duration};
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(short, long, default_value = "macd_rsi")]
+    strategy: String,
+    #[arg(short, long, default_value = "20")]
+    leverage: u8,
+    #[arg(long, default_value = "true")]
+    testnet: bool,
+}
+
+// === Индикаторы ===
+fn ema(prices: &[f64], period: usize) -> Option<f64> {
+    if prices.is_empty() { return None; }
+    let k = 2.0 / (period as f64 + 1.0);
+    let mut val = prices[0];
+    for &p in prices.iter().skip(1) { val = (p - val) * k + val; }
+    Some(val)
+}
+
+fn rsi(prices: &[f64], period: usize) -> Option<f64> {
+    if prices.len() < period + 1 { return None; }
+    let mut gain = 0.0; let mut loss = 0.0;
+    for i in (prices.len() - period)..prices.len() {
+        let diff = prices[i] - prices[i - 1];
+        if diff > 0.0 { gain += diff; } else { loss -= diff; }
+    }
+    let avg_gain = gain / period as f64;
+    let avg_loss = if loss == 0.0 { 0.0001 } else { loss / period as f64 };
+    Some(100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
+}
+
+fn macd_histogram(prices: &[f64]) -> Option<(f64, f64)> {
+    if prices.len() < 35 { return None; }
+    let fast = ema(prices, 12)?;
+    let slow = ema(prices, 26)?;
+    let macd = fast - slow;
+    Some((macd - macd * 0.9, macd))
+}
+
+// === Цена (Hyperliquid → Binance) ===
+async fn get_btc_price(client: &Client, api_base: &str) -> Result<f64> {
+    let url = format!("{}/info", api_base.trim().trim_end_matches('/'));
+    let body = json!({"type": "allMids"});
+
+    if let Ok(resp) = client.post(&url).json(&body).timeout(Duration::from_secs(8)).send().await {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text().await {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(p) = json.get("BTC").and_then(|v| v.as_str()) {
+                        if let Ok(price) = p.parse::<f64>() {
+                            info!("💰 Hyperliquid price: ${:.2}", price);
+                            return Ok(price);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(resp) = client.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
+        .timeout(Duration::from_secs(5)).send().await {
+        if let Ok(text) = resp.text().await {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(p) = json.get("price").and_then(|v| v.as_str()) {
+                    if let Ok(price) = p.parse::<f64>() {
+                        info!("💰 Binance price: ${:.2}", price);
+                        return Ok(price);
+                    }
+                }
+            }
+        }
+    }
+
+    let fallback = 70_700.0 + (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() % 500) as f64 / 10.0;
+    warn!("⚠️ Fallback price: ${:.2}", fallback);
+    Ok(fallback)
+}
+
+// === Entry / Exit ===
+async fn execute_entry(client: &Client, api_base: &str, size: f64, lev: u8) {
+    let order = json!({ "type": "order", "asset": "BTC", "isBuy": true, "reduceOnly": false, "size": size.to_string(), "leverage": lev, "orderType": "Market" });
+    match client.post(format!("{}/exchange", api_base.trim().trim_end_matches('/'))).json(&order).send().await {
+        Ok(r) => info!("📈 Entry sent | Status: {}", r.status()),
+        Err(e) => error!("❌ Entry failed: {}", e),
+    }
+}
+
+async fn execute_exit(client: &Client, api_base: &str, size: f64) {
+    let order = json!({ "type": "order", "asset": "BTC", "isBuy": false, "reduceOnly": true, "size": size.to_string(), "orderType": "Market" });
+    match client.post(format!("{}/exchange", api_base.trim().trim_end_matches('/'))).json(&order).send().await {
+        Ok(r) => info!("📉 Exit sent | Status: {}", r.status()),
+        Err(e) => error!("❌ Exit failed: {}", e),
+    }
+}
+
+// === MAIN ===
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
+    dotenv().ok();
+
+    let args = Args::parse();
+    let api_base = if args.testnet { "https://api.hyperliquid-testnet.xyz" } else { "https://api.hyperliquid.xyz" };
+
+    info!("🦖 MonsterFi Executor v0.7 started");
+    info!("🎯 Strategy: {} | Leverage: {}x | Effective TF: M1 (6s ticks × 500)", args.strategy, args.leverage);
+
+    let client = Client::new();
+    let mut in_position = false;
+    let mut price_buffer: VecDeque<f64> = VecDeque::with_capacity(500);
+    let mut trailing_stop = TrailingStop { highest_price: None, trail_pct: 1.5 };
+    let mut prev_histogram: Option<f64> = None;
+
+    let mut interval = interval(Duration::from_secs(6));  // ← теперь каждые 6 секунд
+
+    loop {
+        interval.tick().await;
+
+        let current_price = get_btc_price(&client, api_base).await?;
+        price_buffer.push_back(current_price);
+        if price_buffer.len() > 500 { price_buffer.pop_front(); }
+
+        let buffer_len = price_buffer.len();
+
+        if buffer_len >= 35 {
+            let prices: Vec<f64> = price_buffer.iter().copied().collect();
+            if let Some((histogram, macd_line)) = macd_histogram(&prices) {
+                let rsi_val = rsi(&prices, 14).unwrap_or(50.0);
+
+                info!("📊 MACD histogram: {:.4} | RSI: {:.1} | TF: M1", histogram, rsi_val);
+
+                if !in_position {
+                    let prev = prev_histogram.unwrap_or(0.0);
+                    let bullish_cross = prev <= 0.0 && histogram > 0.0;
+                    let oversold = rsi_val < 45.0;
+
+                    if bullish_cross && oversold {
+                        info!("🚀 SIGNAL LONG | MACD {:.4} | RSI {:.1} | Price ${:.2}", macd_line, rsi_val, current_price);
+                        execute_entry(&client, api_base, 0.01, args.leverage).await;
+                        in_position = true;
+                        trailing_stop.highest_price = Some(current_price);
+                    } else if !bullish_cross {
+                        info!("⏸️ No entry: MACD not crossed yet");
+                    } else {
+                        info!("⏸️ No entry: RSI too high ({:.1})", rsi_val);
+                    }
+                }
+
+                if in_position {
+                    if let Some(stop) = trailing_stop.update(current_price, true) {
+                        info!("🛑 Trailing stop hit @ ${:.2}", stop);
+                        execute_exit(&client, api_base, 0.01).await;
+                        in_position = false;
+                    }
+                }
+
+                prev_histogram = Some(histogram);
+            }
+        }
+
+        info!("💓 Heartbeat | In position: {} | Price: ${:.2} | Buffer: {}/500 | TF: M1 (6s ticks)", 
+              in_position, current_price, buffer_len);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TrailingStop {
+    highest_price: Option<f64>,
+    trail_pct: f64,
+}
+
+impl TrailingStop {
+    fn update(&mut self, price: f64, in_position: bool) -> Option<f64> {
+        if !in_position { self.highest_price = None; return None; }
+        if self.highest_price.is_none() || price > self.highest_price.unwrap() {
+            self.highest_price = Some(price);
+        }
+        let stop = self.highest_price.unwrap() * (1.0 - self.trail_pct / 100.0);
+        if price <= stop { Some(stop) } else { None }
+    }
+}

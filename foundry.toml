@@ -8,7 +8,7 @@ optimizer_runs = 200
 fs_permissions = [{ access = "read", path = "./" }]
 
 [rpc_endpoints]
-hyperliquid_testnet = "https://api.hyperliquid-testnet.xyz/evm"
+hyperliquid_testnet = "https://rpc.hyperliquid-testnet.xyz"
 hyperliquid_mainnet = "https://api.hyperliquid.xyz/evm"
 
 [etherscan]
