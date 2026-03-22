@@ -1,11 +1,9 @@
 [package]
 name = "monsterfi-executor"
-version = "0.2.0"
+version = "0.8.0"
 edition = "2021"
 description = "MonsterFi trading agent — Rust edition"
 license = "MIT"
-
-# [[bin]] секция НЕ нужна для src/main.rs — Cargo сам найдёт бинарник
 
 [dependencies]
 # === Async runtime ===
@@ -43,6 +41,9 @@ clap = { version = "4", features = ["derive", "color"] }
 
 # === Number formatting ===
 rust_decimal = { version = "1", features = ["serde-with-str"] }
+
+# === Backtest tables ===
+tabled = "0.14"
 
 [dev-dependencies]
 tokio-test = "0.4"
