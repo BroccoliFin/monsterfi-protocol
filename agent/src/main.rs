@@ -1,4 +1,4 @@
-// MonsterFi Executor v0.8.0 — MACD+RSI + LONG/SHORT + Backtest Support
+// MonsterFi Executor v0.9.1 — MACD+RSI + LONG/SHORT + Backtest + Timeframe Sweep
 
 use anyhow::Result;
 use clap::Parser;
@@ -38,6 +38,10 @@ struct Args {
     to: Option<String>,
     #[arg(long)]
     sweep: bool,
+
+    // ✅ НОВОЕ: Параметрический поиск по таймфреймам
+    #[arg(long)]
+    timeframe_sweep: bool,
 }
 
 // === Направление позиции ===
@@ -295,6 +299,29 @@ async fn run_backtest_mode(args: &Args) -> Result<()> {
         (Utc::now() - chrono::Duration::days(7)).timestamp_millis()
     };
 
+    // ✅ НОВОЕ: Обработка флага --timeframe-sweep
+    if args.timeframe_sweep {
+        use backtest::{print_timeframe_comparison, run_timeframe_sweep};
+
+        info!("🔄 Запуск параметрического поиска по таймфреймам...");
+
+        let results = run_timeframe_sweep(
+            &args.symbol,
+            start_time,
+            end_time,
+            &StrategyParams::default(),
+        )
+        .await?;
+
+        print_timeframe_comparison(&results);
+
+        // Опционально: экспорт результатов в JSON
+        // use backtest::export_results_json;
+        // export_results_json(&results[0].result, &StrategyParams::default(), "timeframe_sweep.json")?;
+
+        return Ok(());
+    }
+
     info!(
         "📅 Fetching {} [{}] from {} to {}",
         args.symbol,
@@ -304,7 +331,7 @@ async fn run_backtest_mode(args: &Args) -> Result<()> {
     );
 
     let candles =
-        fetch_binance_klines(&args.symbol, &args.interval, start_time, end_time, 10000).await?;
+        fetch_binance_klines(&args.symbol, &args.interval, start_time, end_time, 500000).await?;
 
     if args.sweep {
         info!("🔍 Running parameter sweep...");
@@ -339,7 +366,7 @@ async fn run_live_mode(args: &Args) -> Result<()> {
         "https://api.hyperliquid.xyz"
     };
 
-    info!("🦖 MonsterFi Executor v0.8.0 started");
+    info!("🦖 MonsterFi Executor v0.9.1 started");
     info!(
         "🎯 Strategy: {} | Leverage: {}x | LONG/SHORT | TF: M1 (6s × 500)",
         args.strategy, args.leverage
