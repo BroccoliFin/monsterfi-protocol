@@ -61,13 +61,13 @@ impl Default for StrategyParams {
     fn default() -> Self {
         Self {
             rsi_period: 14,
-            rsi_oversold: 47.0,
-            rsi_overbought: 53.0,
-            trail_pct: 7.0,
-            take_profit_pct: 11.0,
-            leverage: 10,
+            rsi_oversold: 30.0,   // ← Теперь это уровень перепроданности для волны
+            rsi_overbought: 70.0, // ← Теперь это уровень перекупленности для волны
+            trail_pct: 3.5,
+            take_profit_pct: 6.0,
+            leverage: 20,
             position_size: 0.01,
-            max_loss_pct: 6.0,
+            max_loss_pct: 9.0,
         }
     }
 }
@@ -206,7 +206,6 @@ pub async fn fetch_binance_klines(
     );
 
     while current_start < end_time && all_candles.len() < limit {
-        // ✅ ИСПРАВЛЕНО: убраны лишние пробелы после symbol=
         let url = format!(
             "https://api.binance.com/api/v3/klines?symbol={}&interval={}&startTime={}&endTime={}&limit=1000",
             symbol, binance_interval, current_start, end_time
@@ -306,6 +305,9 @@ pub async fn run_backtest(candles: &[Candle], params: &StrategyParams) -> Result
     let mut entry_price = 0.0;
     let mut prev_histogram: Option<f64> = None;
 
+    // ✅ НОВОЕ: Для 2-состояний RSI (prev + current)
+    let mut prev_rsi: Option<f64> = None;
+
     let mut balance = 1.0;
     let mut peak_balance = 1.0;
     let mut max_drawdown = 0.0;
@@ -341,21 +343,30 @@ pub async fn run_backtest(candles: &[Candle], params: &StrategyParams) -> Result
                     let prev = prev_histogram.unwrap_or(0.0);
                     let bullish_cross = prev <= 0.0 && histogram > 0.0;
                     let bearish_cross = prev >= 0.0 && histogram < 0.0;
-                    let oversold = rsi_val < params.rsi_oversold;
-                    let overbought = rsi_val > params.rsi_overbought;
+
+                    // ✅ RSI WAVE 2-STATE: prev + current
+                    // LONG: RSI был < 30 (prev) → стал > 30 (current)
+                    let rsi_exit_oversold = prev_rsi.map_or(false, |p| p < params.rsi_oversold)
+                        && rsi_val > params.rsi_oversold;
+
+                    // SHORT: RSI был > 70 (prev) → стал < 70 (current)
+                    let rsi_exit_overbought = prev_rsi.map_or(false, |p| p > params.rsi_overbought)
+                        && rsi_val < params.rsi_overbought;
 
                     if idx % 500 == 0 {
-                        info!("🔍 Entry | BullishCross: {} | Oversold: {} | BearishCross: {} | Overbought: {}",
-                              bullish_cross, oversold, bearish_cross, overbought);
+                        info!("🔍 Entry | BullishCross: {} | RSI_exit_oversold: {} | BearishCross: {} | RSI_exit_overbought: {}",
+                              bullish_cross, rsi_exit_oversold, bearish_cross, rsi_exit_overbought);
                     }
 
-                    if bullish_cross && oversold {
+                    // ✅ LONG SIGNAL: MACD кросс + выход RSI из перепроданности
+                    if bullish_cross && rsi_exit_oversold {
                         let ts = DateTime::from_timestamp_millis(candle.timestamp).unwrap();
                         info!(
-                            "🚀 SIGNAL LONG @ {} | MACD: {:.4} | RSI: {:.1} | Price: ${:.2}",
+                            "🚀 SIGNAL LONG (RSI WAVE) @ {} | MACD: {:.4} | RSI: {:.1} (prev: {:.1}) | Price: ${:.2}",
                             ts.format("%m-%d %H:%M:%S"),
                             histogram,
                             rsi_val,
+                            prev_rsi.unwrap_or(0.0),
                             current_price
                         );
                         position = Position::Long;
@@ -363,13 +374,16 @@ pub async fn run_backtest(candles: &[Candle], params: &StrategyParams) -> Result
                         entry_time = candle.timestamp;
                         trailing_stop.reset();
                         trailing_stop.highest_price = Some(current_price);
-                    } else if bearish_cross && overbought {
+                    }
+                    // ✅ SHORT SIGNAL: MACD кросс + выход RSI из перекупленности
+                    else if bearish_cross && rsi_exit_overbought {
                         let ts = DateTime::from_timestamp_millis(candle.timestamp).unwrap();
                         info!(
-                            "🚀 SIGNAL SHORT @ {} | MACD: {:.4} | RSI: {:.1} | Price: ${:.2}",
+                            "🚀 SIGNAL SHORT (RSI WAVE) @ {} | MACD: {:.4} | RSI: {:.1} (prev: {:.1}) | Price: ${:.2}",
                             ts.format("%m-%d %H:%M:%S"),
                             histogram,
                             rsi_val,
+                            prev_rsi.unwrap_or(0.0),
                             current_price
                         );
                         position = Position::Short;
@@ -385,6 +399,7 @@ pub async fn run_backtest(candles: &[Candle], params: &StrategyParams) -> Result
                     let mut should_exit = false;
                     let is_long = position == Position::Long;
 
+                    // ✅ HARD STOP-LOSS
                     let price_stop_loss = if is_long {
                         entry_price * (1.0 - params.max_loss_pct / 100.0 / params.leverage as f64)
                     } else {
@@ -402,6 +417,7 @@ pub async fn run_backtest(candles: &[Candle], params: &StrategyParams) -> Result
                         );
                     }
 
+                    // ✅ TRAILING STOP
                     if !should_exit {
                         if let Some(stop_price) = trailing_stop.update(current_price, is_long) {
                             should_exit = true;
@@ -410,6 +426,7 @@ pub async fn run_backtest(candles: &[Candle], params: &StrategyParams) -> Result
                         }
                     }
 
+                    // ✅ TAKE PROFIT
                     if !should_exit {
                         let raw_pnl = if is_long {
                             (current_price - entry_price) / entry_price * 100.0
@@ -423,6 +440,7 @@ pub async fn run_backtest(candles: &[Candle], params: &StrategyParams) -> Result
                         }
                     }
 
+                    // === Выход из позиции ===
                     if should_exit {
                         let raw_pnl_pct = if position == Position::Long {
                             (current_price - entry_price) / entry_price * 100.0
@@ -471,10 +489,12 @@ pub async fn run_backtest(candles: &[Candle], params: &StrategyParams) -> Result
                     }
                 }
                 prev_histogram = Some(histogram);
+                prev_rsi = Some(rsi_val);
             }
         }
     }
 
+    // === FORCE CLOSE ===
     if position != Position::None {
         let raw_pnl_pct = if position == Position::Long {
             (current_price - entry_price) / entry_price * 100.0
@@ -632,22 +652,19 @@ pub async fn run_timeframe_sweep(
         match fetch_binance_klines(symbol, tf, start_time, end_time, 100000).await {
             Ok(candles) => match run_backtest(&candles, params).await {
                 Ok(result) => {
+                    let total_trades = result.total_trades;
                     results.push(TimeframeResult {
                         timeframe: tf.to_string(),
                         candles_loaded: candles.len(),
                         result: result.clone(),
                     });
-                    println!(
-                        "✅ {} свечей, {} сделок",
-                        candles.len(),
-                        result.total_trades
-                    );
+                    println!("✅ {} свечей, {} сделок", candles.len(), total_trades);
                 }
                 Err(e) => {
                     warn!("⚠️ {} skipped: {}", tf, e);
                     results.push(TimeframeResult {
                         timeframe: tf.to_string(),
-                        candles_loaded: candles.len(),
+                        candles_loaded: 0,
                         result: BacktestResult {
                             total_trades: 0,
                             winning_trades: 0,
@@ -661,7 +678,7 @@ pub async fn run_timeframe_sweep(
                             trades: Vec::new(),
                         },
                     });
-                    println!("⚠️  Пропущено ({} свечей)", candles.len());
+                    println!("⚠️  Пропущено");
                 }
             },
             Err(e) => {
@@ -712,7 +729,6 @@ pub fn print_timeframe_comparison(results: &[TimeframeResult]) {
     println!("{}", "─".repeat(120));
 
     for (i, r) in results.iter().enumerate() {
-        // ✅ Проверяем, есть ли валидные данные
         let has_data = r.result.sharpe_ratio.is_finite() && r.result.total_trades > 0;
 
         let rank = if has_data {
@@ -729,7 +745,6 @@ pub fn print_timeframe_comparison(results: &[TimeframeResult]) {
             "—"
         };
 
-        // ✅ Форматируем значения: "—" если нет данных
         let trades_str = if has_data {
             format!("{}", r.result.total_trades)
         } else {
@@ -777,7 +792,6 @@ pub fn print_timeframe_comparison(results: &[TimeframeResult]) {
 
     println!("{}", "═".repeat(120));
 
-    // ✅ Показываем рекомендацию только если есть валидные результаты
     if let Some(best) = results.iter().find(|r| r.result.sharpe_ratio.is_finite()) {
         println!(
             "\n✅ РЕКОМЕНДАЦИЯ: {} показывает лучший Sharpe Ratio ({:.2})",
