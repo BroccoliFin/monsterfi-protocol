@@ -1,3 +1,4 @@
+// === agent/src/backtest.rs ===
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -7,9 +8,6 @@ use std::fs::File;
 use std::io::Write;
 use tabled::{Table, Tabled};
 use tracing::{info, warn};
-
-use crate::indicators::{calculate_macd_histogram, calculate_rsi, IndicatorContext};
-use crate::strategies::{Signal, Strategy};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candle {
@@ -44,6 +42,80 @@ pub struct TradeLog {
     pub direction: String,
     pub pnl_pct: f64,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StrategyParams {
+    pub rsi_period: usize,
+    pub rsi_oversold: f64,
+    pub rsi_overbought: f64,
+    pub trail_pct: f64,
+    pub take_profit_pct: f64,
+    pub leverage: u8,
+    #[allow(dead_code)]
+    pub position_size: f64,
+    pub max_loss_pct: f64,
+}
+
+impl Default for StrategyParams {
+    fn default() -> Self {
+        Self {
+            _rsi_period: 14,
+            rsi_oversold: 30.0,   // ← Теперь это уровень перепроданности для волны
+            rsi_overbought: 70.0, // ← Теперь это уровень перекупленности для волны
+            trail_pct: 3.5,
+            take_profit_pct: 6.0,
+            leverage: 20,
+            position_size: 0.01,
+            max_loss_pct: 9.0,
+        }
+    }
+}
+
+fn ema(prices: &[f64], period: usize) -> Option<f64> {
+    if prices.is_empty() {
+        return None;
+    }
+    let k = 2.0 / (period as f64 + 1.0);
+    let mut val = prices[0];
+    for &p in prices.iter().skip(1) {
+        val = (p - val) * k + val;
+    }
+    Some(val)
+}
+
+fn rsi(prices: &[f64], period: usize) -> Option<f64> {
+    if prices.len() < period + 1 {
+        return None;
+    }
+    let mut gain = 0.0;
+    let mut loss = 0.0;
+    for i in (prices.len() - period)..prices.len() {
+        let diff = prices[i] - prices[i - 1];
+        if diff > 0.0 {
+            gain += diff;
+        } else {
+            loss -= diff;
+        }
+    }
+    let avg_gain = gain / period as f64;
+    let avg_loss = if loss == 0.0 {
+        0.0001
+    } else {
+        loss / period as f64
+    };
+    Some(100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
+}
+
+fn macd_histogram(prices: &[f64]) -> Option<(f64, f64)> {
+    if prices.len() < 35 {
+        return None;
+    }
+    let fast = ema(prices, 12)?;
+    let slow = ema(prices, 26)?;
+    let macd = fast - slow;
+    let signal = macd * 0.9;
+    Some((macd - signal, macd))
 }
 
 #[derive(Debug, Clone)]
@@ -222,16 +294,18 @@ pub async fn fetch_binance_klines(
     Ok(all_candles)
 }
 
-pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result<BacktestResult> {
+pub async fn run_backtest(candles: &[Candle], params: &StrategyParams) -> Result<BacktestResult> {
     if candles.len() < 50 {
         return Err(anyhow::anyhow!("Not enough candles"));
     }
 
     let mut price_buffer: VecDeque<f64> = VecDeque::with_capacity(500);
-    let mut trailing_stop = TrailingStop::new(strategy.get_trail_pct());
+    let mut trailing_stop = TrailingStop::new(params.trail_pct);
     let mut position = Position::None;
     let mut entry_price = 0.0;
     let mut prev_histogram: Option<f64> = None;
+
+    // ✅ НОВОЕ: Для 2-состояний RSI (prev + current)
     let mut prev_rsi: Option<f64> = None;
 
     let mut balance = 1.0;
@@ -241,6 +315,7 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
     let mut trades = Vec::new();
     let mut trade_returns = Vec::new();
     let mut entry_time: i64 = 0;
+
     let mut current_price = 0.0;
 
     for (idx, candle) in candles.iter().enumerate() {
@@ -253,18 +328,11 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
         if price_buffer.len() >= 35 {
             let prices: Vec<f64> = price_buffer.iter().copied().collect();
 
-            if let Some((histogram, macd_line)) = calculate_macd_histogram(&prices) {
-                let rsi_val = calculate_rsi(&prices, 14).unwrap_or(50.0);
-
-                let ctx = IndicatorContext {
-                    rsi: rsi_val,
-                    prev_rsi,
-                    macd_histogram: histogram,
-                    prev_macd_histogram: prev_histogram,
-                    macd_line,
-                };
+            if let Some((histogram, __macd_line)) = macd_histogram(&prices) {
+                let rsi_val = rsi(&prices, params.rsi_period).unwrap_or(50.0);
 
                 if idx % 1000 == 0 && idx > 0 {
+                    let _prev = prev_histogram.unwrap_or(0.0);
                     info!(
                         "🔍 [{}] MACD: {:.4} | RSI: {:.1} | Price: ${:.2}",
                         idx, histogram, rsi_val, current_price
@@ -272,46 +340,57 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
                 }
 
                 if position == Position::None {
-                    let signal = strategy.generate_signal(&ctx);
+                    let prev = prev_histogram.unwrap_or(0.0);
+                    let bullish_cross = prev <= 0.0 && histogram > 0.0;
+                    let bearish_cross = prev >= 0.0 && histogram < 0.0;
+
+                    // ✅ RSI WAVE 2-STATE: prev + current
+                    // LONG: RSI был < 30 (prev) → стал > 30 (current)
+                    let rsi_exit_oversold = prev_rsi.map_or(false, |p| p < params.rsi_oversold)
+                        && rsi_val > params.rsi_oversold;
+
+                    // SHORT: RSI был > 70 (prev) → стал < 70 (current)
+                    let rsi_exit_overbought = prev_rsi.map_or(false, |p| p > params.rsi_overbought)
+                        && rsi_val < params.rsi_overbought;
 
                     if idx % 500 == 0 {
-                        info!("🔍 Entry | Signal: {:?}", signal);
+                        info!("🔍 Entry | BullishCross: {} | RSI_exit_oversold: {} | BearishCross: {} | RSI_exit_overbought: {}",
+                              bullish_cross, rsi_exit_oversold, bearish_cross, rsi_exit_overbought);
                     }
 
-                    match signal {
-                        Signal::Long => {
-                            let ts = DateTime::from_timestamp_millis(candle.timestamp).unwrap();
-                            info!(
-                                "🚀 SIGNAL LONG (RSI WAVE) @ {} | MACD: {:.4} | RSI: {:.1} (prev: {:.1}) | Price: ${:.2}",
-                                ts.format("%m-%d %H:%M:%S"),
-                                histogram,
-                                rsi_val,
-                                prev_rsi.unwrap_or(0.0),
-                                current_price
-                            );
-                            position = Position::Long;
-                            entry_price = current_price;
-                            entry_time = candle.timestamp;
-                            trailing_stop.reset();
-                            trailing_stop.highest_price = Some(current_price);
-                        }
-                        Signal::Short => {
-                            let ts = DateTime::from_timestamp_millis(candle.timestamp).unwrap();
-                            info!(
-                                "🚀 SIGNAL SHORT (RSI WAVE) @ {} | MACD: {:.4} | RSI: {:.1} (prev: {:.1}) | Price: ${:.2}",
-                                ts.format("%m-%d %H:%M:%S"),
-                                histogram,
-                                rsi_val,
-                                prev_rsi.unwrap_or(0.0),
-                                current_price
-                            );
-                            position = Position::Short;
-                            entry_price = current_price;
-                            entry_time = candle.timestamp;
-                            trailing_stop.reset();
-                            trailing_stop.lowest_price = Some(current_price);
-                        }
-                        Signal::Hold => {}
+                    // ✅ LONG SIGNAL: MACD кросс + выход RSI из перепроданности
+                    if bullish_cross && rsi_exit_oversold {
+                        let ts = DateTime::from_timestamp_millis(candle.timestamp).unwrap();
+                        info!(
+                            "🚀 SIGNAL LONG (RSI WAVE) @ {} | MACD: {:.4} | RSI: {:.1} (prev: {:.1}) | Price: ${:.2}",
+                            ts.format("%m-%d %H:%M:%S"),
+                            histogram,
+                            rsi_val,
+                            prev_rsi.unwrap_or(0.0),
+                            current_price
+                        );
+                        position = Position::Long;
+                        entry_price = current_price;
+                        entry_time = candle.timestamp;
+                        trailing_stop.reset();
+                        trailing_stop.highest_price = Some(current_price);
+                    }
+                    // ✅ SHORT SIGNAL: MACD кросс + выход RSI из перекупленности
+                    else if bearish_cross && rsi_exit_overbought {
+                        let ts = DateTime::from_timestamp_millis(candle.timestamp).unwrap();
+                        info!(
+                            "🚀 SIGNAL SHORT (RSI WAVE) @ {} | MACD: {:.4} | RSI: {:.1} (prev: {:.1}) | Price: ${:.2}",
+                            ts.format("%m-%d %H:%M:%S"),
+                            histogram,
+                            rsi_val,
+                            prev_rsi.unwrap_or(0.0),
+                            current_price
+                        );
+                        position = Position::Short;
+                        entry_price = current_price;
+                        entry_time = candle.timestamp;
+                        trailing_stop.reset();
+                        trailing_stop.lowest_price = Some(current_price);
                     }
                 }
 
@@ -319,13 +398,12 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
                     let mut exit_reason = String::new();
                     let mut should_exit = false;
                     let is_long = position == Position::Long;
-                    let max_loss_pct = strategy.get_max_loss_pct();
-                    let leverage = 20; // из StrategyParams::default()
 
+                    // ✅ HARD STOP-LOSS
                     let price_stop_loss = if is_long {
-                        entry_price * (1.0 - max_loss_pct / 100.0 / leverage as f64)
+                        entry_price * (1.0 - params.max_loss_pct / 100.0 / params.leverage as f64)
                     } else {
-                        entry_price * (1.0 + max_loss_pct / 100.0 / leverage as f64)
+                        entry_price * (1.0 + params.max_loss_pct / 100.0 / params.leverage as f64)
                     };
 
                     if (is_long && current_price <= price_stop_loss)
@@ -335,10 +413,11 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
                         exit_reason = "hard_stop_loss".to_string();
                         info!(
                             "🛑 HARD STOP-LOSS @ ${:.2} (entry: ${:.2}, loss: -{:.2}%)",
-                            current_price, entry_price, max_loss_pct
+                            current_price, entry_price, params.max_loss_pct
                         );
                     }
 
+                    // ✅ TRAILING STOP
                     if !should_exit {
                         if let Some(stop_price) = trailing_stop.update(current_price, is_long) {
                             should_exit = true;
@@ -347,19 +426,21 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
                         }
                     }
 
+                    // ✅ TAKE PROFIT
                     if !should_exit {
                         let raw_pnl = if is_long {
                             (current_price - entry_price) / entry_price * 100.0
                         } else {
                             (entry_price - current_price) / entry_price * 100.0
                         };
-                        if raw_pnl >= strategy.get_take_profit_pct() {
+                        if raw_pnl >= params.take_profit_pct {
                             should_exit = true;
                             exit_reason = "take_profit".to_string();
                             info!("✅ Take-profit: +{:.1}%", raw_pnl);
                         }
                     }
 
+                    // === Выход из позиции ===
                     if should_exit {
                         let raw_pnl_pct = if position == Position::Long {
                             (current_price - entry_price) / entry_price * 100.0
@@ -367,7 +448,7 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
                             (entry_price - current_price) / entry_price * 100.0
                         };
 
-                        let leveraged_pnl = raw_pnl_pct * leverage as f64;
+                        let leveraged_pnl = raw_pnl_pct * params.leverage as f64;
                         let commission = 0.08;
                         let pnl_pct = leveraged_pnl - commission;
 
@@ -420,8 +501,8 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
         } else {
             (entry_price - current_price) / entry_price * 100.0
         };
-        let leverage = 20;
-        let leveraged_pnl = raw_pnl_pct * leverage as f64;
+
+        let leveraged_pnl = raw_pnl_pct * params.leverage as f64;
         let commission = 0.08;
         let pnl_pct = leveraged_pnl - commission;
 
@@ -502,25 +583,29 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
     })
 }
 
-// === Экспорт функций (без изменений) ===
 #[allow(dead_code)]
 pub fn export_results_json(
     result: &BacktestResult,
-    _params: &crate::strategies::macd_rsi::MacdRsiStrategy,
+    params: &StrategyParams,
     filepath: &str,
 ) -> Result<()> {
     #[derive(Serialize)]
     struct ExportData {
+        params: StrategyParams,
         result: BacktestResult,
         timestamp: String,
     }
+
     let data = ExportData {
+        params: params.clone(),
         result: result.clone(),
         timestamp: Utc::now().to_rfc3339(),
     };
+
     let json = serde_json::to_string_pretty(&data)?;
     let mut file = File::create(filepath)?;
     file.write_all(json.as_bytes())?;
+
     info!("💾 Exported results to {}", filepath);
     Ok(())
 }
@@ -528,15 +613,16 @@ pub fn export_results_json(
 #[allow(dead_code)]
 pub fn export_trades_csv(trades: &[TradeLog], filepath: &str) -> Result<()> {
     let mut wtr = csv::Writer::from_path(filepath)?;
+
     for trade in trades {
         wtr.serialize(trade)?;
     }
+
     wtr.flush()?;
     info!("💾 Exported {} trades to {}", trades.len(), filepath);
     Ok(())
 }
 
-// === TimeframeResult и sweep функции (без изменений) ===
 #[derive(Debug, Clone)]
 pub struct TimeframeResult {
     pub timeframe: String,
@@ -548,10 +634,8 @@ pub async fn run_timeframe_sweep(
     symbol: &str,
     start_time: i64,
     end_time: i64,
-    strategy: &dyn Strategy,
+    params: &StrategyParams,
 ) -> Result<Vec<TimeframeResult>> {
-    //use crate::strategies::macd_rsi::MacdRsiStrategy;
-
     let timeframes = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"];
     let mut results = Vec::new();
 
@@ -566,7 +650,7 @@ pub async fn run_timeframe_sweep(
         print!("⏳ Тестируем {}... ", tf);
 
         match fetch_binance_klines(symbol, tf, start_time, end_time, 100000).await {
-            Ok(candles) => match run_backtest(&candles, strategy).await {
+            Ok(candles) => match run_backtest(&candles, params).await {
                 Ok(result) => {
                     let total_trades = result.total_trades;
                     results.push(TimeframeResult {
@@ -618,6 +702,7 @@ pub async fn run_timeframe_sweep(
                 println!("❌ Ошибка загрузки");
             }
         }
+
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
 
@@ -636,6 +721,7 @@ pub fn print_timeframe_comparison(results: &[TimeframeResult]) {
     println!("\n");
     println!("🏆 СРАВНЕНИЕ ТАЙМФРЕЙМОВ (отсортировано по Sharpe Ratio)");
     println!("{}", "═".repeat(120));
+
     println!(
         "{:<8} {:>10} {:>8} {:>8} {:>12} {:>12} {:>12} {:>10} {:>10}",
         "Rank", "TF", "Candles", "Trades", "Win Rate", "Return", "Max DD", "Sharpe", "Commissions"
@@ -644,6 +730,7 @@ pub fn print_timeframe_comparison(results: &[TimeframeResult]) {
 
     for (i, r) in results.iter().enumerate() {
         let has_data = r.result.sharpe_ratio.is_finite() && r.result.total_trades > 0;
+
         let rank = if has_data {
             if i == 0 {
                 "🥇"
@@ -702,6 +789,7 @@ pub fn print_timeframe_comparison(results: &[TimeframeResult]) {
             comm_str
         );
     }
+
     println!("{}", "═".repeat(120));
 
     if let Some(best) = results.iter().find(|r| r.result.sharpe_ratio.is_finite()) {
@@ -713,37 +801,8 @@ pub fn print_timeframe_comparison(results: &[TimeframeResult]) {
     } else {
         println!("\n⚠️  Нет валидных результатов для рекомендации");
     }
+
     println!("\n");
-}
-
-// === ParamSweep (оставляем как есть для совместимости) ===
-#[derive(Debug, Clone)]
-pub struct StrategyParams {
-    #[allow(dead_code)]
-    pub rsi_period: usize,
-    pub rsi_oversold: f64,
-    pub rsi_overbought: f64,
-    pub trail_pct: f64,
-    pub take_profit_pct: f64,
-    pub leverage: u8,
-    #[allow(dead_code)]
-    pub position_size: f64,
-    pub max_loss_pct: f64,
-}
-
-impl Default for StrategyParams {
-    fn default() -> Self {
-        Self {
-            rsi_period: 14,
-            rsi_oversold: 30.0,
-            rsi_overbought: 70.0,
-            trail_pct: 3.5,
-            take_profit_pct: 6.0,
-            leverage: 20,
-            position_size: 0.01,
-            max_loss_pct: 9.0,
-        }
-    }
 }
 
 pub struct ParamSweep {
@@ -764,13 +823,10 @@ impl Default for ParamSweep {
         }
     }
 }
-
 pub async fn run_param_sweep(
     candles: &[Candle],
     sweep: &ParamSweep,
 ) -> Result<Vec<(StrategyParams, BacktestResult)>> {
-    use crate::strategies::macd_rsi::MacdRsiStrategy;
-
     let mut results = Vec::new();
     let base = StrategyParams::default();
     for &ro in &sweep.rsi_oversold_range {
@@ -778,16 +834,13 @@ pub async fn run_param_sweep(
             for &tp in &sweep.trail_pct_range {
                 for &tf in &sweep.take_profit_range {
                     for &lv in &sweep.leverage_range {
-                        let strategy = MacdRsiStrategy::new(ro, rb, tp, tf, base.max_loss_pct);
-                        if let Ok(r) = run_backtest(candles, &strategy).await {
-                            let p = StrategyParams {
-                                rsi_oversold: ro,
-                                rsi_overbought: rb,
-                                trail_pct: tp,
-                                take_profit_pct: tf,
-                                leverage: lv,
-                                ..base.clone()
-                            };
+                        let mut p = base.clone();
+                        p.rsi_oversold = ro;
+                        p.rsi_overbought = rb;
+                        p.trail_pct = tp;
+                        p.take_profit_pct = tf;
+                        p.leverage = lv;
+                        if let Ok(r) = run_backtest(candles, &p).await {
                             results.push((p, r));
                         }
                     }

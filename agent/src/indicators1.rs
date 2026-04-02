@@ -38,13 +38,13 @@ impl MACD {
         
         let fast_ema = ema(prices, self.fast_period)?;
         let slow_ema = ema(prices, self.slow_period)?;
-        let macd_line = fast_ema - slow_ema;
+        let _macd_line = fast_ema - slow_ema;
         
         // Упрощённый сигнал (для продакшена нужен массив исторических MACD)
-        let signal_line = macd_line * 0.9; // заглушка
-        let histogram = macd_line - signal_line;
+        let signal_line = _macd_line * 0.9; // заглушка
+        let histogram = _macd_line - signal_line;
         
-        Some((macd_line, signal_line, histogram))
+        Some((_macd_line, signal_line, histogram))
     }
     
     // Сигнал: гистограмма пересекает 0 снизу вверх → лонг

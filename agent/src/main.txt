@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
 
         if buffer_len >= 35 {
             let prices: Vec<f64> = price_buffer.iter().copied().collect();
-            if let Some((histogram, macd_line)) = macd_histogram(&prices) {
+            if let Some((histogram, _macd_line)) = macd_histogram(&prices) {
                 let rsi_val = rsi(&prices, 14).unwrap_or(50.0);
 
                 info!("📊 MACD histogram: {:.4} | RSI: {:.1} | TF: M1", histogram, rsi_val);
@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
                     let oversold = rsi_val < 45.0;
 
                     if bullish_cross && oversold {
-                        info!("🚀 SIGNAL LONG | MACD {:.4} | RSI {:.1} | Price ${:.2}", macd_line, rsi_val, current_price);
+                        info!("🚀 SIGNAL LONG | MACD {:.4} | RSI {:.1} | Price ${:.2}", _macd_line, rsi_val, current_price);
                         execute_entry(&client, api_base, 0.01, args.leverage).await;
                         in_position = true;
                         trailing_stop.highest_price = Some(current_price);
