@@ -8,7 +8,7 @@ use std::io::Write;
 use tabled::{Table, Tabled};
 use tracing::{info, warn};
 
-use crate::indicators::{calculate_macd_histogram, calculate_rsi, IndicatorContext};
+use crate::indicators::{calculate_ao, calculate_macd_histogram, calculate_rsi, IndicatorContext};
 use crate::strategies::{Signal, Strategy};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +234,10 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
     let mut prev_histogram: Option<f64> = None;
     let mut prev_rsi: Option<f64> = None;
 
+    // === AO buffers ===
+    let mut ao_values: VecDeque<Option<f64>> = VecDeque::with_capacity(100);
+    let mut candle_history: VecDeque<(f64, f64, f64, f64)> = VecDeque::with_capacity(10); // (O,H,L,C)
+
     let mut balance = 1.0;
     let mut peak_balance = 1.0;
     let mut max_drawdown = 0.0;
@@ -250,11 +254,28 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
             price_buffer.pop_front();
         }
 
+        // Save candle to history
+        candle_history.push_back((candle.open, candle.high, candle.low, candle.close));
+        if candle_history.len() > 10 {
+            candle_history.pop_front();
+        }
+
         if price_buffer.len() >= 35 {
             let prices: Vec<f64> = price_buffer.iter().copied().collect();
 
             if let Some((histogram, macd_line)) = calculate_macd_histogram(&prices) {
                 let rsi_val = calculate_rsi(&prices, 14).unwrap_or(50.0);
+
+                // === Calculate AO using close as proxy for median ===
+                let ao_val = if price_buffer.len() >= 34 {
+                    calculate_ao(&prices, &prices, 5, 34)
+                } else {
+                    None
+                };
+                ao_values.push_back(ao_val);
+                if ao_values.len() > 100 {
+                    ao_values.pop_front();
+                }
 
                 let ctx = IndicatorContext {
                     rsi: rsi_val,
@@ -262,12 +283,27 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
                     macd_histogram: histogram,
                     prev_macd_histogram: prev_histogram,
                     macd_line,
+                    // AO fields: current + 3 previous
+                    ao: ao_val,
+                    prev_ao: ao_values
+                        .get(ao_values.len().saturating_sub(2))
+                        .and_then(|&x| x),
+                    prev_prev_ao: ao_values
+                        .get(ao_values.len().saturating_sub(3))
+                        .and_then(|&x| x),
+                    prev_prev_prev_ao: ao_values
+                        .get(ao_values.len().saturating_sub(4))
+                        .and_then(|&x| x),
+                    // Candle fields: current + 2 previous
+                    current_candle: candle_history.back().copied(),
+                    prev_candle: candle_history.iter().rev().nth(1).copied(),
+                    prev_prev_candle: candle_history.iter().rev().nth(2).copied(),
                 };
 
                 if idx % 1000 == 0 && idx > 0 {
                     info!(
-                        "🔍 [{}] MACD: {:.4} | RSI: {:.1} | Price: ${:.2}",
-                        idx, histogram, rsi_val, current_price
+                        "🔍 [{}] MACD: {:.4} | RSI: {:.1} | AO: {:?} | Price: ${:.2}",
+                        idx, histogram, rsi_val, ao_val, current_price
                     );
                 }
 
@@ -282,12 +318,10 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
                         Signal::Long => {
                             let ts = DateTime::from_timestamp_millis(candle.timestamp).unwrap();
                             info!(
-                                "🚀 SIGNAL LONG (RSI WAVE) @ {} | MACD: {:.4} | RSI: {:.1} (prev: {:.1}) | Price: ${:.2}",
+                                "🚀 SIGNAL LONG @ {} | Price: ${:.2} | AO: {:?}",
                                 ts.format("%m-%d %H:%M:%S"),
-                                histogram,
-                                rsi_val,
-                                prev_rsi.unwrap_or(0.0),
-                                current_price
+                                current_price,
+                                ao_val
                             );
                             position = Position::Long;
                             entry_price = current_price;
@@ -298,12 +332,10 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
                         Signal::Short => {
                             let ts = DateTime::from_timestamp_millis(candle.timestamp).unwrap();
                             info!(
-                                "🚀 SIGNAL SHORT (RSI WAVE) @ {} | MACD: {:.4} | RSI: {:.1} (prev: {:.1}) | Price: ${:.2}",
+                                "🚀 SIGNAL SHORT @ {} | Price: ${:.2} | AO: {:?}",
                                 ts.format("%m-%d %H:%M:%S"),
-                                histogram,
-                                rsi_val,
-                                prev_rsi.unwrap_or(0.0),
-                                current_price
+                                current_price,
+                                ao_val
                             );
                             position = Position::Short;
                             entry_price = current_price;
@@ -502,7 +534,7 @@ pub async fn run_backtest(candles: &[Candle], strategy: &dyn Strategy) -> Result
     })
 }
 
-// === Экспорт функций (без изменений) ===
+// === Экспорт функций ===
 #[allow(dead_code)]
 pub fn export_results_json(
     result: &BacktestResult,
@@ -536,7 +568,7 @@ pub fn export_trades_csv(trades: &[TradeLog], filepath: &str) -> Result<()> {
     Ok(())
 }
 
-// === TimeframeResult и sweep функции (без изменений) ===
+// === TimeframeResult и sweep функции ===
 #[derive(Debug, Clone)]
 pub struct TimeframeResult {
     pub timeframe: String,
@@ -550,8 +582,6 @@ pub async fn run_timeframe_sweep(
     end_time: i64,
     strategy: &dyn Strategy,
 ) -> Result<Vec<TimeframeResult>> {
-    //use crate::strategies::macd_rsi::MacdRsiStrategy;
-
     let timeframes = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"];
     let mut results = Vec::new();
 
@@ -716,7 +746,7 @@ pub fn print_timeframe_comparison(results: &[TimeframeResult]) {
     println!("\n");
 }
 
-// === ParamSweep (оставляем как есть для совместимости) ===
+// === ParamSweep ===
 #[derive(Debug, Clone)]
 pub struct StrategyParams {
     #[allow(dead_code)]
